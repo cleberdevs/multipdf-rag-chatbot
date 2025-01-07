@@ -6,17 +6,27 @@ import os
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document
-from crewai import Crew, Agent, Task
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.agents import initialize_agent, Tool
+from langchain.chains import RetrievalQA
+from langchain.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.llms import HuggingFacePipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from huggingface_hub import login
 import re
+import torch
+
+# Verificar se o PyTorch está funcionando corretamente
+try:
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+except Exception as e:
+    st.error(f"Erro ao verificar o PyTorch: {str(e)}")
 
 # Autenticar no Hugging Face
 try:
-    login()
+    login(token="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")
     st.success("Autenticado no Hugging Face com sucesso!")
 except Exception as e:
     st.error(f"Erro ao autenticar no Hugging Face: {str(e)}")
@@ -75,14 +85,11 @@ def load_documents_from_folder(folder_path):
 
 # Pré-processamento de texto (remoção de stopwords e divisão de textos longos)
 def preprocess_text(text):
-    # Remover caracteres especiais e stopwords simples
     text = re.sub(r'\s+', ' ', text)  # Remove espaços extras
     text = re.sub(r'[^\w\s]', '', text)  # Remove pontuação
-
-    # Dividir textos longos em pedaços menores
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,  # Tamanho máximo de cada pedaço
-        chunk_overlap=200  # Sobreposição entre pedaços
+        chunk_size=500,  # Tamanho máximo de cada pedaço
+        chunk_overlap=100  # Sobreposição entre pedaços
     )
     chunks = text_splitter.split_text(text)
     return chunks
@@ -99,30 +106,42 @@ def create_vector_store(texts):
         st.error(f"Erro ao criar o banco de dados vetorial: {str(e)}")
         return None
 
-# Carregar o modelo LLaMA 2
-def load_llama2_model():
+# Função para carregar o modelo GPT-Neo 2.7B (sem CUDA)
+def load_model():
     try:
-        model_name = "meta-llama/Llama-2-7b-chat-hf"  # Modelo LLaMA 2
+        model_name = "EleutherAI/gpt-neo-2.7B"  # Modelo GPT-Neo 2.7B
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
-        return pipeline("text-generation", model=model, tokenizer=tokenizer)
+        model = AutoModelForCausalLM.from_pretrained(model_name)  # Carregar na CPU
+        llm_pipeline = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_length=512,  # Aumente o valor conforme necessário
+            max_new_tokens=200,  # Define o número máximo de tokens na resposta
+            temperature=0.7,  # Controla a criatividade da resposta
+            do_sample=True  # Permite amostragem para respostas mais variadas
+        )
+        return HuggingFacePipeline(pipeline=llm_pipeline)
     except Exception as e:
-        st.error(f"Erro ao carregar o modelo LLaMA 2: {str(e)}")
+        st.error(f"Erro ao carregar o modelo: {str(e)}")
         return None
 
-# Função para gerar respostas com o LLaMA 2
-def ask_llama2(query, context, llm_pipeline):
+# Função para criar um agente de busca
+def create_search_agent(vector_store, llm):
     try:
-        input_text = f"Contexto: {context}\n\nPergunta: {query}"
-        response = llm_pipeline(input_text, max_length=200, do_sample=True, temperature=0.7)
-        return response[0]['generated_text']
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vector_store.as_retriever(search_kwargs={"k": 3})  # Aumente o número de documentos
+        )
+        return qa_chain
     except Exception as e:
-        st.error(f"Erro ao gerar resposta: {str(e)}")
-        return "Erro ao gerar resposta."
+        st.error(f"Erro ao criar o agente de busca: {str(e)}")
+        return None
 
 # Interface Gráfica com Streamlit
 def main():
-    st.title("Multi PDF RAG Chatbot com CrewAI e LLaMA 2")
+    st.title("Multi PDF RAG Chatbot com LangChain e GPT-Neo 2.7B")
     st.write("Faça perguntas com base em documentos PDF, DOCX ou TXT.")
 
     # Inicializar o histórico de conversas
@@ -150,56 +169,17 @@ def main():
             # Criar banco de dados vetorial
             vector_store = create_vector_store(processed_texts)
             if vector_store:
-                # Carregar o modelo LLaMA 2
-                llm_pipeline = load_llama2_model()
-                if llm_pipeline:
-                    # Criar agentes do CrewAI
-                    pdf_search_agent = Agent(
-                        role="PDF Search Specialist",
-                        goal="Buscar e extrair informações relevantes de documentos PDF.",
-                        backstory="Você é um especialista em buscar informações específicas em documentos PDF.",
-                        allow_delegation=False,
-                        verbose=True
-                    )
-
-                    pdf_summarizer_agent = Agent(
-                        role="PDF Summarizer",
-                        goal="Gerar resumos claros e concisos de textos extraídos de PDFs usando LLaMA 2.",
-                        backstory="Você é um especialista em processamento de linguagem natural e geração de resumos.",
-                        allow_delegation=False,
-                        verbose=True
-                    )
+                # Carregar o modelo
+                llm = load_model()
+                if llm:
+                    # Criar agente de busca
+                    search_agent = create_search_agent(vector_store, llm)
 
                     # Loop do chatbot
                     query = st.text_input("Faça uma pergunta:")
                     if query:
-                        # Recuperar documentos relevantes
-                        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-                        relevant_docs = retriever.get_relevant_documents(query)
-                        context = "\n".join([doc.page_content for doc in relevant_docs])
-
-                        # Criar tarefas do CrewAI
-                        search_task = Task(
-                            description=f"Buscar no PDF pela consulta: '{query}'",
-                            agent=pdf_search_agent,
-                            expected_output="Informações relevantes extraídas do PDF."
-                        )
-
-                        summarize_task = Task(
-                            description="Resumir o texto extraído do PDF usando LLaMA 2.",
-                            agent=pdf_summarizer_agent,
-                            expected_output="Resumo claro e conciso do texto gerado pelo LLaMA 2."
-                        )
-
-                        # Criar a equipe (Crew)
-                        crew = Crew(
-                            agents=[pdf_search_agent, pdf_summarizer_agent],
-                            tasks=[search_task, summarize_task],
-                            verbose=2  # Mostra logs detalhados do processo
-                        )
-
-                        # Executar a equipe
-                        result = crew.kickoff(inputs={"query": query, "context": context})
+                        # Executar a busca
+                        result = search_agent.run(query)
 
                         # Adicionar ao histórico
                         st.session_state.history.append({"Pergunta": query, "Resposta": result})
@@ -213,3 +193,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
